@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Akıllı Hastane Paneli</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<!-- Giriş -->
+<section id="login-view" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <div class="brand big"><span class="logo">✚</span> Akıllı Hastane</div>
+    <p class="muted">Agent'larla yönetilen iç hava kalitesi ve enerji paneli</p>
+    <label>Kullanıcı adı<input name="username" autocomplete="username" required></label>
+    <label>Parola<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="btn primary" type="submit">Giriş yap</button>
+    <p id="login-error" class="error" hidden></p>
+    <p class="muted small">Hesaplar yönetici tarafından açılır.</p>
+  </form>
+</section>
+
+<!-- Uygulama -->
+<section id="app-view" hidden>
+  <header class="topbar">
+    <div class="brand"><span class="logo">✚</span> Akıllı Hastane <span class="muted">· 3. Kat</span></div>
+    <nav class="tabs">
+      <button data-view="dashboard" class="tab active">Panel</button>
+      <button data-view="admin" class="tab admin-only">Yönetim</button>
+    </nav>
+    <div class="top-right">
+      <span id="sim-clock" class="pill" title="Simülasyon saati"></span>
+      <span id="conn" class="dot ok" title="Sunucu bağlantısı"></span>
+      <span id="who" class="muted"></span>
+      <button id="logout" class="btn ghost">Çıkış</button>
+    </div>
+  </header>
+
+  <main id="dashboard" class="view">
+    <section class="energy" id="energy"></section>
+    <section class="grid">
+      <div class="card plan-card">
+        <div class="card-head">
+          <h2>Kat planı</h2>
+          <div class="legend">
+            <span><i class="sw ok"></i>Normal</span><span><i class="sw warning"></i>Uyarı</span>
+            <span><i class="sw critical"></i>Kritik</span><span><i class="sw offline"></i>Veri yok</span>
+          </div>
+        </div>
+        <svg id="plan" viewBox="-1 -1 102 58" role="img" aria-label="Kat planı"></svg>
+        <div class="plan-metric">
+          Renk: <select id="plan-metric">
+            <option value="status">Genel durum</option>
+            <option value="co2_ppm">CO2</option>
+            <option value="pm25">PM2.5</option>
+            <option value="occupancy">Doluluk</option>
+          </select>
+        </div>
+      </div>
+      <div class="card" id="room-detail"></div>
+    </section>
+    <section class="card">
+      <div class="card-head">
+        <h2>Agent karar akışı</h2>
+        <label class="small muted"><input type="checkbox" id="feed-room-only"> Sadece seçili oda</label>
+      </div>
+      <ol id="feed" class="feed"></ol>
+    </section>
+  </main>
+
+  <main id="admin" class="view" hidden>
+    <nav class="subtabs">
+      <button data-sub="users" class="tab active">Kullanıcılar</button>
+      <button data-sub="devices" class="tab">Cihazlar</button>
+      <button data-sub="agents" class="tab">Agent'lar</button>
+    </nav>
+    <div id="admin-body"></div>
+  </main>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

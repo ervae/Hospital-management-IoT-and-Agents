@@ -12,7 +12,7 @@ from sqlmodel import Session
 
 from .config import settings
 from .db import get_engine, init_db
-from .routers import agents, auth, devices, overview, rooms, users
+from .routers import agents, auth, devices, flow, overview, rooms, users
 from .seed import seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -28,6 +28,9 @@ def enabled_adapters():
     if settings.rule_agent_enabled:
         from .adapters.rule_agent import RuleAgents
         out.append(RuleAgents())
+    if settings.auto_approve_s > 0:
+        from .adapters.auto_approve import AutoApprove
+        out.append(AutoApprove())
     if settings.mqtt_enabled:
         from .adapters.mqtt_bridge import MqttBridge
         out.append(MqttBridge())
@@ -47,10 +50,10 @@ def create_app(start_adapters: bool = True) -> FastAPI:
         for a in running:
             await a.stop()
 
-    app = FastAPI(title="Akıllı Hastane API", version="1.0.0", lifespan=lifespan,
-                  description="Agent'larla yönetilen akıllı hastane sistemi. Sözleşme: docs/API.md")
+    app = FastAPI(title="Yatak Yönetimi API", version="2.0.0", lifespan=lifespan,
+                  description="IoT destekli çok ajanlı hastane yatak yönetimi. Sözleşme: docs/API.md")
     api = APIRouter(prefix="/api/v1")
-    for r in (auth, users, rooms, devices, agents, overview):
+    for r in (auth, users, rooms, flow, devices, agents, overview):
         api.include_router(r.router)
 
     @api.get("/health", tags=["Genel görünüm"])

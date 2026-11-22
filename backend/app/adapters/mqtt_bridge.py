@@ -2,7 +2,7 @@
 
 Konu sözleşmesi:
   hastane/<device_id>/telemetry  (cihaz -> sunucu)  {"key": "<cihaz anahtarı>", "metrics": {...}}
-  hastane/<device_id>/commands   (sunucu -> cihaz)  {"id": "cmd_..", "actuator": "fan", "value": 70}
+  hastane/<device_id>/commands   (sunucu -> cihaz)  {"id": "cmd_..", "actuator": "led", "value": "ready"}
   hastane/<device_id>/ack        (cihaz -> sunucu)  {"key": "...", "id": "cmd_..", "status": "done"}
 ESP32 HTTP de kullanabilir; ikisi aynı çekirdekten geçer.
 """

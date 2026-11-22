@@ -6,7 +6,7 @@ from sqlmodel import Session, col, select
 from ..db import get_session
 from ..deps import current_device, current_user, require_admin
 from ..models import Command, CommandStatus, Device, Room, User
-from ..schemas import CommandAck, CommandOut, DeviceCreate, DeviceCreated, DeviceOut, TelemetryIn
+from ..schemas import CommandAck, CommandOut, DeviceCreate, DeviceCreated, DeviceOut, StateIn, TelemetryIn
 from ..security import hash_key, new_api_key
 from ..services import core
 
@@ -69,6 +69,15 @@ def telemetry(body: TelemetryIn, dev: Device = Depends(current_device), s: Sessi
         raise HTTPException(400, "Cihaz bir odaya atanmamış")
     n = core.ingest(s, body.metrics, room_id, device_id=dev.id, ts=body.ts)
     return {"accepted": n}
+
+
+@router.post("/me/state", status_code=202)
+def device_state(body: StateIn, dev: Device = Depends(current_device), s: Session = Depends(get_session)):
+    """Durumu cihazın kendisi (ya da dış sınıflandırıcı) hesaplıyorsa doğrudan bildirir."""
+    if dev.room_id is None:
+        raise HTTPException(400, "Cihaz bir odaya atanmamış")
+    st = core.set_state(s, dev.room_id, body.state, body.confidence, "external", body.ts)
+    return {"state": st.state.value}
 
 
 @router.get("/me/commands", response_model=list[CommandOut])

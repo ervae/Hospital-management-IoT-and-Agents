@@ -1,4 +1,4 @@
-// Akıllı Hastane paneli. Derleme gerektirmez; sunucu bu dosyayı doğrudan verir.
+// Yatak yönetimi paneli. Derleme gerektirmez; sunucu bu dosyayı doğrudan verir.
 import { api, auth } from "./api.js";
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -6,12 +6,26 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const fmt = (v, d = 0) => (v == null || Number.isNaN(v) ? "–" : Number(v).toLocaleString("tr-TR", { maximumFractionDigits: d, minimumFractionDigits: d }));
 const timeOf = (iso) => new Date(iso).toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
-const STATUS_TR = { ok: "Normal", warning: "Uyarı", critical: "Kritik", offline: "Veri yok" };
-const TYPE_TR = { icu: "Yoğun bakım", patient: "Hasta odası", waiting: "Bekleme", corridor: "Koridor", other: "Diğer" };
-const ACT_TR = { fan: "Taze hava fanı", purifier: "Hava temizleyici", light: "Aydınlatma" };
-const AGENT_TYPE_TR = { room: "Oda", energy: "Enerji", coordinator: "Koordinatör", custom: "Özel", baseline: "Temel" };
+const COLS = ["occupied", "vacated", "cleaning", "ready"];
+const STATE_TR = { occupied: "Dolu", vacated: "Temizlik bekliyor", cleaning: "Temizleniyor", ready: "Hazır", unknown: "Bilinmiyor" };
+const SOURCE_TR = { inference: "sensörlerden çıkarıldı", external: "dış sınıflandırıcı", manual: "elle girildi", none: "henüz yok" };
+const SEX_TR = { F: "Kadın", M: "Erkek", any: "Fark etmez" };
+const URG_TR = { 1: "Çok acil", 2: "Acil", 3: "Orta", 4: "Düşük", 5: "Çok düşük" };
+const AGENT_TYPE_TR = { coordinator: "Koordinatör", ed: "Acil Servis", ward: "Servis", cleaning: "Temizlik/Taburcu", single: "Tek ajan (LLM)", custom: "Özel", baseline: "Temel (kural)" };
+const REC_TR = { pending: "Onay bekliyor", approved: "Onaylandı", rejected: "Reddedildi", blocked: "Kısıt ihlali", superseded: "Geçersiz" };
 
-const state = { overview: null, selected: null, planMetric: "status", seenDecisions: new Set(), timer: null, series: [] };
+const state = { ov: null, selected: null, ward: "", showHis: false, seen: new Set(), timer: null, busy: false };
+const canAct = () => ["admin", "operator"].includes(auth.user?.role);
+// Süreleri simülasyon dakikasına çevir (simülatör hızlandırılmışsa)
+const simMin = (realMin) => (realMin == null ? null : realMin * (state.ov?.kpis.time_scale || 1));
+const dur = (min) => {
+  if (min == null) return "–";
+  if (min < 60) return `${Math.round(min)} dk`;
+  if (min < 48 * 60) return `${Math.floor(min / 60)} sa ${Math.round(min % 60)} dk`;
+  return `${Math.round(min / 1440)} gün`;
+};
+const short = (min) => (min == null ? "" : min < 60 ? `${Math.round(min)} dk` : min < 48 * 60 ? `${Math.round(min / 60)} sa` : `${Math.round(min / 1440)} g`);
+const since = (iso) => (iso ? simMin((Date.now() - new Date(iso).getTime()) / 60000) : null);
 
 // ---------------- Giriş ----------------
 function showLogin() {
@@ -38,7 +52,7 @@ window.addEventListener("auth:expired", showLogin);
 function toast(msg) {
   const t = $("#toast");
   t.textContent = msg; t.hidden = false;
-  clearTimeout(toast._t); toast._t = setTimeout(() => (t.hidden = true), 2600);
+  clearTimeout(toast._t); toast._t = setTimeout(() => (t.hidden = true), 2800);
 }
 
 // ---------------- Sekmeler ----------------
@@ -55,178 +69,258 @@ async function start() {
   $("#app-view").hidden = false;
   $("#who").textContent = `${user.full_name || user.username} · ${{ admin: "Yönetici", operator: "Operatör", viewer: "İzleyici" }[user.role]}`;
   document.querySelectorAll(".admin-only").forEach((el) => (el.hidden = user.role !== "admin"));
+  document.querySelectorAll(".operator-only").forEach((el) => (el.hidden = !canAct()));
   await refresh();
   clearInterval(state.timer);
   state.timer = setInterval(refresh, 3000);
 }
 
 async function refresh() {
+  if (state.busy) return;
   try {
-    state.overview = await api.get("/overview");
+    state.ov = await api.get("/overview");
     $("#conn").className = "dot ok";
-    renderEnergy(); renderPlan(); renderDetail(); renderFeed();
+    renderKpis(); renderLanes(); renderRecs(); renderQueue(); renderFeed();
+    if (!$("#drawer").hidden && state.selected) renderDrawer();
   } catch (e) {
     if (e.status !== 401) $("#conn").className = "dot bad";
   }
 }
 
-// ---------------- Enerji şeridi ----------------
-function renderEnergy() {
-  const { energy: e, alerts, agents_online, rooms } = state.overview;
-  const site = rooms.length ? null : null;
-  const net = (e.pv_kw ?? 0) - (e.load_kw ?? 0);
-  const selfUse = e.load_kw ? Math.min(100, (100 * (e.pv_kw ?? 0)) / e.load_kw) : null;
-  const bat = e.battery_pct;
-  $("#energy").innerHTML = `
-    <div class="kpi"><div class="label">☀️ Güneş üretimi</div>
-      <div class="value">${fmt(e.pv_kw, 2)} <small>kW</small></div>
-      <div class="sub">${net >= 0 ? `+${fmt(net, 2)} kW fazla` : `${fmt(-net, 2)} kW açık`}</div></div>
-    <div class="kpi"><div class="label">⚡ Toplam tüketim</div>
-      <div class="value">${fmt(e.load_kw, 2)} <small>kW</small></div>
-      <div class="sub">Güneşten karşılanan: %${fmt(selfUse)}</div></div>
-    <div class="kpi"><div class="label">🔋 Batarya</div>
-      <div class="value ${bat < 30 ? "v-warning" : ""}">%${fmt(bat)}</div>
-      <div class="bar"><i style="width:${bat ?? 0}%"></i></div></div>
-    <div class="kpi"><div class="label">🏭 Şebekeden</div>
-      <div class="value">${fmt(Math.max(0, e.grid_kw ?? 0), 2)} <small>kW</small></div>
-      <div class="sub">${(e.grid_kw ?? 0) < 0 ? `${fmt(-e.grid_kw, 2)} kW şebekeye veriliyor` : "&nbsp;"}</div></div>
-    <div class="kpi"><div class="label">🚨 Kritik oda / 🤖 Agent</div>
-      <div class="value"><span class="${alerts ? "v-critical" : "v-ok"}">${alerts}</span> <small>/</small> ${agents_online} <small>çevrimiçi</small></div>
-      <div class="sub">${rooms.filter((r) => r.status === "warning").length} odada uyarı</div></div>`;
-  void site;
+// ---------------- Göstergeler ----------------
+function renderKpis() {
+  const k = state.ov.kpis;
+  const occPct = k.total_rooms ? (100 * k.occupied) / k.total_rooms : null;
+  $("#kpis").innerHTML = `
+    <div class="kpi ${k.ed_waiting ? "alert" : ""}"><div class="label">Acilde yatak bekleyen</div>
+      <div class="value">${k.ed_waiting} <small>hasta</small></div>
+      <div class="sub">ort. ${dur(simMin(k.avg_wait_min))} · en uzun ${dur(simMin(k.max_wait_min))}</div></div>
+    <div class="kpi"><div class="label">Hazır yatak</div>
+      <div class="value v-ready">${k.ready_beds}</div>
+      <div class="sub">${k.soon_ready} yatak yakında hazır</div></div>
+    <div class="kpi ${k.hidden_free ? "hint" : ""}"><div class="label">Gizli boş yatak</div>
+      <div class="value">${k.hidden_free}</div>
+      <div class="sub">hazır ama HBYS'de görünmüyor</div></div>
+    <div class="kpi"><div class="label">Doluluk</div>
+      <div class="value">%${fmt(occPct)}</div>
+      <div class="bar"><i style="width:${occPct ?? 0}%"></i></div></div>
+    <div class="kpi"><div class="label">Onay bekleyen öneri</div>
+      <div class="value">${k.pending_recommendations}</div>
+      <div class="sub">${state.ov.agents_online} ajan çevrimiçi${k.unknown ? ` · ${k.unknown} oda veri vermiyor` : ""}</div></div>`;
   const clock = $("#sim-clock");
-  if (e.sim_hour != null) {
-    const h = Math.floor(e.sim_hour), mm = Math.floor((e.sim_hour - h) * 60);
-    clock.textContent = `Simülasyon saati ${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-    clock.hidden = false;
-  } else clock.hidden = true;
+  clock.hidden = !k.sim_clock;
+  if (k.sim_clock) clock.textContent = `Simülasyon · ${k.sim_clock}`;
 }
 
-// ---------------- Kat planı ----------------
-function scaleClass(r) {
-  if (state.planMetric === "status") return r.status;
-  const v = r.metrics[state.planMetric];
-  if (v == null) return "offline";
-  const t = r.thresholds || {};
-  const lim = {
-    co2_ppm: [t.co2_warn ?? 1000, t.co2_crit ?? 1400],
-    pm25: [t.pm25_warn ?? 25, t.pm25_crit ?? 50],
-    occupancy: [r.type === "waiting" ? 12 : 2, r.type === "waiting" ? 20 : 3],
-  }[state.planMetric];
-  return v >= lim[1] ? "critical" : v >= lim[0] ? "warning" : "ok";
+// ---------------- Kanban kat planı ----------------
+function colOf(r) {
+  if (r.state !== "unknown") return r.state;
+  return COLS.includes(r.his_state) ? r.his_state : "occupied";  // son bilinen (HBYS) durum
 }
 
-function renderPlan() {
-  const svg = $("#plan");
-  const rooms = state.overview.rooms;
-  if (!state.selected && rooms.length) state.selected = rooms[0].id;
-  svg.innerHTML = rooms.map((r) => {
-    const L = r.layout || {};
-    if (L.w == null) return "";
-    const m = r.metrics;
-    const cx = L.x + L.w / 2, cy = L.y + L.h / 2;
-    const short = L.h < 12;
-    const icons = [m.fan_pct > 30 ? "🌀" : "", m.purifier_pct > 0 ? "🫧" : "", m.light_pct > 0 ? "💡" : ""].join("");
-    const line2 = `${fmt(m.co2_ppm)} ppm · ${fmt(m.occupancy)} kişi`;
-    return `<g class="room st-${scaleClass(r)} ${r.id === state.selected ? "sel" : ""}" data-id="${r.id}" tabindex="0">
-      <rect x="${L.x}" y="${L.y}" width="${L.w}" height="${L.h}" rx="1.2"/>
-      ${short
-        ? `<text class="name" x="${cx}" y="${cy + 0.9}" text-anchor="middle">${esc(r.name)} · <tspan class="val">${line2}</tspan> ${icons}</text>`
-        : `<text class="name" x="${cx}" y="${cy - 2}" text-anchor="middle">${esc(r.name)}</text>
-           <text class="val" x="${cx}" y="${cy + 2}" text-anchor="middle">${line2}</text>
-           <text class="icons" x="${cx}" y="${cy + 6}" text-anchor="middle">${icons}</text>`}
-    </g>`;
+function card(r) {
+  const tags = [];
+  if (r.isolation) tags.push(`<span class="chip iso" title="İzolasyon odası">İzolasyon</span>`);
+  if (r.sex !== "any") tags.push(`<span class="chip" title="${SEX_TR[r.sex]} hasta">${r.sex === "F" ? "K" : "E"}</span>`);
+  if (r.hidden_free) tags.push(`<span class="chip hidden-free" title="HBYS'de: ${STATE_TR[r.his_state]}">Gizli boş</span>`);
+  if (r.reserved_for) tags.push(`<span class="chip reserved">Ayrıldı</span>`);
+  if (r.state === "unknown") tags.push(`<span class="chip unknown" title="Sensör verisi gelmiyor">?</span>`);
+  const his = state.showHis && r.his_state !== r.state ? `<div class="his">HBYS: ${STATE_TR[r.his_state]}</div>` : "";
+  const low = r.state !== "unknown" && r.confidence < 0.6;
+  return `<button class="room st-${r.state} ${low ? "low" : ""} ${r.id === state.selected ? "sel" : ""}" data-id="${r.id}"
+      title="${esc(r.name)} · ${STATE_TR[r.state]} · ${SOURCE_TR[r.state_source] || ""}">
+    <div class="room-top"><b>${esc(r.code.split("-").pop())}</b><span class="t" title="Bu durumda ${dur(since(r.state_since))}">${short(since(r.state_since))}</span></div>
+    ${tags.length ? `<div class="tags">${tags.join("")}</div>` : ""}${his}
+  </button>`;
+}
+
+function renderLanes() {
+  const rooms = state.ov.rooms;
+  const wards = [...new Set(rooms.map((r) => r.ward))];
+  const sel = $("#ward-filter");
+  if (sel.options.length !== wards.length + 1) {
+    sel.innerHTML = `<option value="">Tüm servisler</option>` + wards.map((w) => `<option>${esc(w)}</option>`).join("");
+    sel.value = state.ward;
+  }
+  // FLIP: kartların eski yerini kaydet, yeniden çiz, farkı canlandır
+  const before = new Map([...document.querySelectorAll("#lanes .room")].map((el) => [el.dataset.id, el.getBoundingClientRect()]));
+  $("#lanes").innerHTML = wards.filter((w) => !state.ward || w === state.ward).map((w) => {
+    const rs = rooms.filter((r) => r.ward === w);
+    const occ = rs.filter((r) => r.state === "occupied").length;
+    return `<section class="lane">
+      <div class="lane-head"><b>${esc(w)}</b><span class="small muted">${rs[0]?.floor ?? ""}. kat · ${occ}/${rs.length} dolu</span></div>
+      ${COLS.map((c) => `<div class="cell col-${c}" data-label="${STATE_TR[c]}">${rs.filter((r) => colOf(r) === c).map(card).join("")}</div>`).join("")}
+    </section>`;
   }).join("");
-  svg.querySelectorAll(".room").forEach((g) => {
-    const pick = () => { state.selected = g.dataset.id; state.series = []; renderPlan(); renderDetail(true); renderFeed(); };
-    g.addEventListener("click", pick);
-    g.addEventListener("keydown", (e) => (e.key === "Enter" || e.key === " ") && pick());
+  document.querySelectorAll("#lanes .room").forEach((el) => {
+    const old = before.get(el.dataset.id);
+    if (old) {
+      const now = el.getBoundingClientRect();
+      const dx = old.left - now.left, dy = old.top - now.top;
+      if (Math.abs(dx) + Math.abs(dy) > 2) {
+        el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }],
+          { duration: 650, easing: "cubic-bezier(.2,.7,.2,1)" });
+        el.animate([{ boxShadow: "0 0 0 3px var(--accent)" }, { boxShadow: "0 0 0 0 transparent" }], { duration: 1600 });
+      }
+    }
+    el.addEventListener("click", () => openRoom(el.dataset.id));
   });
 }
-$("#plan-metric").addEventListener("change", (e) => { state.planMetric = e.target.value; renderPlan(); });
+$("#ward-filter").addEventListener("change", (e) => { state.ward = e.target.value; renderLanes(); });
+$("#show-his").addEventListener("change", (e) => { state.showHis = e.target.checked; renderLanes(); });
+
+// ---------------- Öneriler ----------------
+const reqById = () => Object.fromEntries(state.ov.requests.map((r) => [r.id, r]));
+const roomById = () => Object.fromEntries(state.ov.rooms.map((r) => [r.id, r]));
+
+function reqLine(q) {
+  if (!q) return `<span class="muted">Talep kapandı</span>`;
+  return `<b>${esc(q.patient_ref || q.id)}</b> · ${esc(q.ward)} · <span class="urg u${q.urgency}">${URG_TR[q.urgency]}</span>
+    ${q.sex !== "any" ? ` · ${SEX_TR[q.sex]}` : ""}${q.isolation ? ` · <span class="chip iso">İzolasyon</span>` : ""}`;
+}
+
+function renderRecs() {
+  const reqs = reqById(), rooms = roomById();
+  const recs = state.ov.recommendations;
+  const pending = recs.filter((r) => r.status === "pending")
+    .sort((a, b) => (reqs[a.request_id]?.urgency ?? 9) - (reqs[b.request_id]?.urgency ?? 9));
+  const recent = recs.filter((r) => r.status !== "pending" && r.status !== "superseded").slice(0, 4);
+  $("#rec-count").textContent = pending.length ? `${pending.length} onay bekliyor` : "";
+  const item = (rec) => {
+    const q = reqs[rec.request_id] || rec.request;
+    const cands = rec.candidates.map((c) => {
+      const room = rooms[c.room_id];
+      const ok = !c.violations.length;
+      return `<li class="${ok ? "ok" : "bad"} ${rec.chosen_room_id === c.room_id ? "chosen" : ""}">
+        <div><b>${esc(c.room_code || c.room_id)}</b> <span class="small muted">${esc(room?.ward || "")}</span>
+          ${c.reason ? `<div class="small">${esc(c.reason)}</div>` : ""}
+          ${c.violations.map((v) => `<div class="small v-bad">✕ ${esc(v)}</div>`).join("")}</div>
+        ${rec.status === "pending" && ok && canAct() ? `<button class="btn small primary" data-approve="${rec.id}" data-room="${c.room_id}">Onayla</button>` : ""}
+      </li>`;
+    }).join("");
+    const wait = q ? ` · ${dur(simMin(q.waiting_min))} ${q.status === "waiting" ? "bekliyor" : "bekledi"}` : "";
+    return `<article class="rec st-${rec.status} ${state.seen.size && !state.seen.has(rec.id) ? "fresh" : ""}">
+      <div class="rec-head"><div>${reqLine(q)}<span class="small muted">${wait}</span></div>
+        <span class="badge ${rec.status}">${REC_TR[rec.status]}</span></div>
+      <div class="small muted">${esc(rec.agent_name || rec.agent_id)} · ${timeOf(rec.created_at)}</div>
+      ${rec.rationale ? `<p class="why">${esc(rec.rationale)}</p>` : ""}
+      <ol class="cands">${cands}</ol>
+      ${rec.status === "pending" && canAct() ? `<div class="rec-actions"><button class="btn small" data-reject="${rec.id}">Reddet</button></div>` : ""}
+      ${rec.decision_note ? `<div class="small muted">Not: ${esc(rec.decision_note)}</div>` : ""}
+    </article>`;
+  };
+  $("#recs").innerHTML = pending.length || recent.length
+    ? pending.map(item).join("") + (recent.length ? `<div class="small muted sep">Son kararlar</div>` + recent.map(item).join("") : "")
+    : `<div class="empty">Henüz öneri yok</div>`;
+  recs.forEach((r) => state.seen.add(r.id));
+  if (!state.seen.size) state.seen.add("_");
+  $("#recs").querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", () => decide(b.dataset.approve, "approve", { room_id: b.dataset.room })));
+  $("#recs").querySelectorAll("[data-reject]").forEach((b) => b.addEventListener("click", () => decide(b.dataset.reject, "reject", {})));
+}
+
+async function decide(id, kind, body) {
+  state.busy = true;
+  try {
+    const r = await api.post(`/recommendations/${id}/${kind}`, body);
+    toast(kind === "approve" ? `Onaylandı: ${r.candidates.find((c) => c.room_id === r.chosen_room_id)?.room_code} ayrıldı` : "Öneri reddedildi");
+  } catch (e) { toast(e.message); }
+  state.busy = false;
+  refresh();
+}
+
+// ---------------- Bekleyenler ----------------
+function renderQueue() {
+  const pendingFor = new Set(state.ov.recommendations.filter((r) => r.status === "pending").map((r) => r.request_id));
+  const list = state.ov.requests;
+  $("#queue").innerHTML = list.length ? list.map((q) => `
+    <li><div>${reqLine(q)}</div>
+      <div class="small muted">${q.origin === "ed" ? "Acil" : q.origin === "elective" ? "Planlı" : "Nakil"} · ${dur(simMin(q.waiting_min))} bekliyor
+        ${pendingFor.has(q.id) ? ` · <span class="v-ready">öneri var</span>` : ""}</div></li>`).join("")
+    : `<li class="empty">Yatak bekleyen hasta yok</li>`;
+}
+
+$("#new-req").addEventListener("click", () => {
+  const wards = [...new Set(state.ov.rooms.map((r) => r.ward))];
+  state.selected = null;
+  $("#drawer-body").innerHTML = `<h2 id="drawer-title">Yeni yatış talebi</h2>
+    <p class="small muted">Gerçek hasta kimliği girmeyin; kısa bir sentetik kod yeterli.</p>
+    <form id="req-form" class="stack">
+      <label>Hasta kodu<input name="patient_ref" placeholder="H-2001" maxlength="40"></label>
+      <label>Servis<select name="ward">${wards.map((w) => `<option>${esc(w)}</option>`).join("")}</select></label>
+      <label>Cinsiyet<select name="sex"><option value="F">Kadın</option><option value="M">Erkek</option><option value="any">Belirtilmedi</option></select></label>
+      <label>Aciliyet<select name="urgency">${[1, 2, 3, 4, 5].map((u) => `<option value="${u}" ${u === 3 ? "selected" : ""}>${u} · ${URG_TR[u]}</option>`).join("")}</select></label>
+      <label class="row"><input type="checkbox" name="isolation"> İzolasyon gerekiyor</label>
+      <label class="row"><input type="checkbox" name="allow_overflow"> Başka servise yatabilir</label>
+      <button class="btn primary">Talebi aç</button>
+    </form>`;
+  $("#drawer").hidden = false;
+  $("#req-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    try {
+      await api.post("/requests", { patient_ref: f.get("patient_ref"), ward: f.get("ward"), sex: f.get("sex"),
+        urgency: Number(f.get("urgency")), isolation: f.has("isolation"), allow_overflow: f.has("allow_overflow"), origin: "ed" });
+      toast("Talep açıldı"); closeDrawer(); refresh();
+    } catch (err) { toast(err.message); }
+  });
+});
+
+// ---------------- Ajan akışı ----------------
+function renderFeed() {
+  const list = state.ov.decisions;
+  $("#feed").innerHTML = list.length ? list.slice(0, 8).map((d) => `<li class="${d.level}">
+      <span class="time">${timeOf(d.created_at)}</span>
+      <span class="who">${esc(d.agent_name || d.agent_id)}</span>
+      <span class="what">${esc(d.summary)}</span></li>`).join("")
+    : `<li class="muted small">Ajanlar serbest metin kayıt gönderdiğinde burada görünür.</li>`;
+}
 
 // ---------------- Oda detayı ----------------
-let lastSeriesFetch = 0;
-async function renderDetail(force = false) {
-  const r = state.overview.rooms.find((x) => x.id === state.selected);
-  const el = $("#room-detail");
-  if (!r) { el.innerHTML = `<div class="empty">Bir oda seçin</div>`; return; }
-  const m = r.metrics;
-  const canControl = ["admin", "operator"].includes(auth.user.role);
-  // Kaydırıcı sürüklenirken yeniden çizme
-  if (el.contains(document.activeElement) && document.activeElement.type === "range") return;
-  el.innerHTML = `
-    <div class="detail-title">
-      <div><h2>${esc(r.name)}</h2><div class="small muted">${TYPE_TR[r.type]} · öncelik ${r.priority} · ${fmt(r.volume_m3)} m³</div></div>
-      <span class="badge ${r.status}">${STATUS_TR[r.status]}</span>
-    </div>
-    <div class="metrics">
-      <div class="metric"><div class="label">CO2</div><div class="value ${statusOf(m.co2_ppm, r.thresholds.co2_warn ?? warnDefault(r, "co2"), r.thresholds.co2_crit ?? critDefault(r, "co2"))}">${fmt(m.co2_ppm)} <small class="muted">ppm</small></div></div>
-      <div class="metric"><div class="label">PM2.5</div><div class="value">${fmt(m.pm25, 1)} <small class="muted">µg/m³</small></div></div>
-      <div class="metric"><div class="label">Doluluk</div><div class="value">${fmt(m.occupancy)} <small class="muted">kişi</small></div></div>
-      <div class="metric"><div class="label">Sıcaklık / nem</div><div class="value">${fmt(m.temp_c, 1)}° <small class="muted">%${fmt(m.humidity)}</small></div></div>
-    </div>
-    <div class="small muted">CO2 · son 60 dk</div>
-    <svg class="spark" id="spark" viewBox="0 0 100 40" preserveAspectRatio="none"></svg>
-    <div class="actuators">
-      ${["fan", "purifier", "light"].map((a) => `
-        <div class="act"><span>${ACT_TR[a]}</span>
-          <input type="range" min="0" max="100" step="5" value="${m[a + "_pct"] ?? 0}" data-act="${a}" ${canControl ? "" : "disabled"}>
-          <span class="num">%${fmt(m[a + "_pct"])}</span></div>`).join("")}
-    </div>
-    <div class="small muted" style="margin-top:8px">${canControl ? "Kaydırıcı elle müdahale komutu gönderir; agent sonraki turda yeniden karar verebilir." : "Elle müdahale için operatör yetkisi gerekir."}
-      ${r.updated_at ? `· Son veri ${timeOf(r.updated_at)}` : ""}</div>`;
-  el.querySelectorAll("input[type=range]").forEach((inp) => {
-    inp.addEventListener("input", () => (inp.nextElementSibling.textContent = `%${inp.value}`));
-    inp.addEventListener("change", async () => {
-      try {
-        await api.post(`/rooms/${r.id}/commands`, { actuator: inp.dataset.act, value: Number(inp.value), reason: "Panelden elle müdahale" });
-        toast(`${ACT_TR[inp.dataset.act]} → %${inp.value} komutu gönderildi`);
-        inp.blur();
-      } catch (e) { toast(e.message); }
-    });
-  });
-  if (force || Date.now() - lastSeriesFetch > 10000 || !state.series.length) {
-    lastSeriesFetch = Date.now();
-    try { state.series = await api.get(`/rooms/${r.id}/series?metric=co2_ppm&minutes=60`); } catch { /* sessiz */ }
+function openRoom(id) { state.selected = id; $("#drawer").hidden = false; renderDrawer(true); renderLanes(); }
+function closeDrawer() { $("#drawer").hidden = true; state.selected = null; renderLanes(); }
+document.querySelectorAll("[data-close]").forEach((el) => el.addEventListener("click", closeDrawer));
+document.addEventListener("keydown", (e) => e.key === "Escape" && !$("#drawer").hidden && closeDrawer());
+
+let transitions = [];
+async function renderDrawer(fetchHistory = false) {
+  const r = state.ov.rooms.find((x) => x.id === state.selected);
+  if (!r) return;
+  const body = $("#drawer-body");
+  if (body.contains(document.activeElement) && ["SELECT", "INPUT"].includes(document.activeElement.tagName)) return;
+  if (fetchHistory || !transitions.length || transitions[0]?.room_id !== r.id) {
+    try { transitions = (await api.get(`/rooms/${r.id}/transitions?hours=48`)).reverse(); } catch { transitions = []; }
   }
-  drawSpark(r);
+  const m = r.metrics;
+  const opt = (sel) => Object.entries(STATE_TR).map(([k, v]) => `<option value="${k}" ${k === sel ? "selected" : ""}>${v}</option>`).join("");
+  body.innerHTML = `
+    <div class="detail-title"><div><h2 id="drawer-title">${esc(r.name)}</h2>
+      <div class="small muted">${esc(r.code)} · ${r.isolation ? "izolasyon odası · " : ""}${r.sex === "any" ? "karma" : SEX_TR[r.sex]} · ${r.beds} yatak</div></div>
+      <span class="badge st-${r.state}">${STATE_TR[r.state]}</span></div>
+    <div class="metrics">
+      <div class="metric"><div class="label">IoT durumu</div><div class="value">${STATE_TR[r.state]}</div>
+        <div class="small muted">${SOURCE_TR[r.state_source] || ""} · güven %${fmt(r.confidence * 100)} · ${dur(since(r.state_since))}</div></div>
+      <div class="metric ${r.hidden_free ? "hint" : ""}"><div class="label">HBYS'de görünen</div><div class="value">${STATE_TR[r.his_state]}</div>
+        <div class="small muted">${r.hidden_free ? "Gizli boş yatak" : r.his_updated_at ? `güncelleme ${timeOf(r.his_updated_at)}` : "kayıt yok"}</div></div>
+      <div class="metric"><div class="label">Yatak yükü</div><div class="value">${fmt(m.bed_load_kg, 1)} <small class="muted">kg</small></div></div>
+      <div class="metric"><div class="label">Hareket / kapı</div><div class="value">${fmt(m.motion)} <small class="muted">/ ${fmt(m.door_events ?? m.door_open)}</small></div></div>
+      <div class="metric"><div class="label">Sıcaklık / nem</div><div class="value">${fmt(m.temp_c, 1)}° <small class="muted">%${fmt(m.humidity)}</small></div></div>
+      <div class="metric"><div class="label">Bağlantı</div><div class="value ${r.online ? "v-ready" : "v-bad"}">${r.online ? "Veri geliyor" : "Veri yok"}</div>
+        <div class="small muted">${r.updated_at ? `son ölçüm ${timeOf(r.updated_at)}` : ""}</div></div>
+    </div>
+    ${canAct() ? `<div class="stack">
+      <div class="row"><button class="btn small" id="his-ready">HBYS'ye "hazır" gir</button>
+        <span class="small muted">Hemşire/temizlik personelinin elle girişi</span></div>
+      <form class="row" id="fix-state"><select name="state">${opt(r.state)}</select><button class="btn small">Durumu düzelt</button></form>
+      <form class="row" id="add-label"><select name="state">${opt(r.state)}</select><input name="note" placeholder="Etiket notu (laboratuvar)"><button class="btn small">Etiketle</button></form>
+    </div>` : ""}
+    <h3 class="small muted">Durum geçmişi</h3>
+    <ol class="history">${transitions.slice(0, 12).map((t) => `<li><span class="time">${timeOf(t.ts)}</span>
+      <span class="${t.channel}">${t.channel === "his" ? "HBYS" : "IoT"}</span> ${STATE_TR[t.from_state]} → <b>${STATE_TR[t.to_state]}</b></li>`).join("") || `<li class="muted">Kayıt yok</li>`}</ol>`;
+  const post = async (path, b, msg) => { try { await api.post(path, b); toast(msg); await refresh(); renderDrawer(true); } catch (e) { toast(e.message); } };
+  $("#his-ready")?.addEventListener("click", () => post(`/rooms/${r.id}/his-state`, { state: "ready" }, "HBYS durumu güncellendi"));
+  $("#fix-state")?.addEventListener("submit", (e) => { e.preventDefault(); post(`/rooms/${r.id}/state`, { state: new FormData(e.target).get("state") }, "Durum düzeltildi"); });
+  $("#add-label")?.addEventListener("submit", (e) => { e.preventDefault(); const f = new FormData(e.target); post(`/rooms/${r.id}/labels`, { state: f.get("state"), note: f.get("note") }, "Etiket kaydedildi"); });
 }
-const warnDefault = (r) => ({ icu: 800, patient: 1000 }[r.type] ?? 1000);
-const critDefault = (r) => ({ icu: 1000, patient: 1400 }[r.type] ?? 1500);
-const statusOf = (v, w, c) => (v == null ? "" : v >= c ? "v-critical" : v >= w ? "v-warning" : "");
-
-function drawSpark(r) {
-  const svg = $("#spark");
-  if (!svg) return;
-  const pts = state.series.map((p) => p.value);
-  if (pts.length < 2) { svg.innerHTML = ""; return; }
-  const warn = r.thresholds.co2_warn ?? warnDefault(r);
-  const lo = Math.min(400, ...pts), hi = Math.max(warn * 1.1, ...pts);
-  const y = (v) => 38 - ((v - lo) / (hi - lo)) * 36;
-  const step = 100 / (pts.length - 1);
-  const d = pts.map((v, i) => `${i ? "L" : "M"}${(i * step).toFixed(2)},${y(v).toFixed(2)}`).join("");
-  svg.innerHTML = `<path class="area" d="${d}L100,40L0,40Z"/><path class="line" d="${d}"/>
-    <line class="thr" x1="0" x2="100" y1="${y(warn)}" y2="${y(warn)}"><title>Uyarı eşiği ${warn} ppm</title></line>`;
-}
-
-// ---------------- Karar akışı ----------------
-function renderFeed() {
-  const roomOnly = $("#feed-room-only").checked;
-  const rooms = Object.fromEntries(state.overview.rooms.map((r) => [r.id, r]));
-  const list = state.overview.decisions.filter((d) => !roomOnly || d.room_id === state.selected);
-  $("#feed").innerHTML = list.length ? list.map((d) => {
-    const fresh = !state.seenDecisions.has(d.id) && state.seenDecisions.size > 0;
-    return `<li class="${d.level} ${fresh ? "fresh" : ""}">
-      <span class="time">${timeOf(d.created_at)}</span>
-      <span class="who ${esc(d.agent_type)}">${esc(d.agent_name || d.agent_id)}</span>
-      <span class="what">${esc(d.summary)}${d.command_ids.length ? ` <span class="muted small">(${d.command_ids.length} komut)</span>` : ""}</span>
-    </li>`;
-  }).join("") : `<li class="muted">Henüz karar yok${roomOnly && rooms[state.selected] ? ` (${esc(rooms[state.selected].name)})` : ""}</li>`;
-  state.overview.decisions.forEach((d) => state.seenDecisions.add(d.id));
-  if (state.seenDecisions.size === 0) state.seenDecisions.add("_");
-}
-$("#feed-room-only").addEventListener("change", renderFeed);
 
 // ---------------- Yönetim ----------------
 let adminTab = "users";
@@ -271,12 +365,12 @@ async function renderAdmin(tab, notice = "") {
       }));
     } else if (tab === "devices") {
       const [devices, rooms] = await Promise.all([api.get("/devices"), api.get("/rooms")]);
-      const roomName = Object.fromEntries(rooms.map((r) => [r.id, r.name]));
+      const roomName = Object.fromEntries(rooms.map((r) => [r.id, `${r.code} · ${r.ward}`]));
       body.innerHTML = `<div class="card">${notice}
-        <div class="card-head"><h2>Cihazlar</h2><span class="small muted">Gerçek ESP32 bir odaya atanınca simülatör o odayı otomatik bırakır.</span></div>
+        <div class="card-head"><h2>Cihazlar</h2><span class="small muted">Gerçek ESP32 bir odaya atanınca simülatör o odayı otomatik bırakır ve durumu bu cihazın sensörlerinden çıkarılır.</span></div>
         <form class="form-row" id="new-device">
           <label>Cihaz adı<input name="name" required placeholder="ESP32-Oda-1"></label>
-          <label>Oda<select name="room_id">${rooms.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join("")}</select></label>
+          <label>Oda<select name="room_id">${rooms.map((r) => `<option value="${r.id}">${esc(r.code)} · ${esc(r.ward)}</option>`).join("")}</select></label>
           <button class="btn primary">ESP32 kaydet</button></form>
         <div class="overflow"><table class="list"><tr><th>Kimlik</th><th>Ad</th><th>Oda</th><th>Tür</th><th>Son görülme</th><th></th></tr>
         ${devices.map((d) => `<tr><td class="muted small">${esc(d.id)}</td><td>${esc(d.name)}</td><td>${esc(roomName[d.room_id] || "–")}</td>
@@ -287,7 +381,7 @@ async function renderAdmin(tab, notice = "") {
         e.preventDefault();
         const f = Object.fromEntries(new FormData(e.target));
         try {
-          const d = await api.post("/devices", { ...f, kind: "physical", capabilities: { sensors: ["co2_ppm", "pm25", "occupancy", "temp_c", "humidity"], actuators: ["fan", "purifier", "light"] } });
+          const d = await api.post("/devices", { ...f, kind: "physical", capabilities: { sensors: ["bed_load_kg", "motion", "door_events", "temp_c", "humidity"], actuators: ["led"] } });
           renderAdmin("devices", secretBox(`${d.name} kaydedildi (${d.id})`, d.api_key, "Bu anahtar sadece şimdi gösteriliyor. ESP32 yazılımına X-Device-Key olarak girin."));
         } catch (err) { toast(err.message); }
       });
@@ -298,22 +392,22 @@ async function renderAdmin(tab, notice = "") {
     } else {
       const agents = await api.get("/agents");
       body.innerHTML = `<div class="card">${notice}
-        <div class="card-head"><h2>Agent'lar</h2><span class="small muted">Dış agent'lar anahtarla durumu okur ve karar gönderir (docs/API.md).</span></div>
+        <div class="card-head"><h2>Ajanlar</h2><span class="small muted">Dış ajanlar anahtarla durumu okur, yatış talebi açar ve yatak önerisi gönderir (docs/API.md).</span></div>
         <form class="form-row" id="new-agent">
-          <label>Ad<input name="name" required placeholder="Oda agent'ı v1"></label>
-          <label>Tür<select name="agent_type"><option value="room">Oda</option><option value="energy">Enerji</option><option value="coordinator">Koordinatör</option><option value="custom">Özel</option></select></label>
+          <label>Ad<input name="name" required placeholder="Koordinatör v1"></label>
+          <label>Tür<select name="agent_type">${Object.entries(AGENT_TYPE_TR).filter(([k]) => k !== "baseline").map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select></label>
           <label>Açıklama<input name="description"></label>
-          <button class="btn primary">Agent kaydet</button></form>
+          <button class="btn primary">Ajan kaydet</button></form>
         <div class="overflow"><table class="list"><tr><th>Kimlik</th><th>Ad</th><th>Tür</th><th>Kaynak</th><th>Son görülme</th><th></th></tr>
         ${agents.map((a) => `<tr><td class="muted small">${esc(a.id)}</td><td>${esc(a.name)}</td><td>${AGENT_TYPE_TR[a.agent_type] || esc(a.agent_type)}</td>
-          <td>${a.builtin ? "Yerleşik (eşik)" : "Dış"}</td><td>${a.last_seen ? timeOf(a.last_seen) : "–"}</td>
+          <td>${a.builtin ? "Yerleşik (kural)" : "Dış"}</td><td>${a.last_seen ? timeOf(a.last_seen) : "–"}</td>
           <td><button class="btn small" data-agent="${a.id}" data-active="${a.active}">${a.active ? "Durdur" : "Başlat"}</button></td></tr>`).join("")}
         </table></div></div>`;
       $("#new-agent").addEventListener("submit", async (e) => {
         e.preventDefault();
         try {
           const a = await api.post("/agents", Object.fromEntries(new FormData(e.target)));
-          renderAdmin("agents", secretBox(`${a.name} kaydedildi (${a.id})`, a.api_key, "Bu anahtar sadece şimdi gösteriliyor. Agent koduna X-Agent-Key olarak girin."));
+          renderAdmin("agents", secretBox(`${a.name} kaydedildi (${a.id})`, a.api_key, "Bu anahtar sadece şimdi gösteriliyor. Ajan koduna X-Agent-Key olarak girin."));
         } catch (err) { toast(err.message); }
       });
       body.querySelectorAll("[data-agent]").forEach((b) => b.addEventListener("click", async () => {

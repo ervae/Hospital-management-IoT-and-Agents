@@ -9,26 +9,25 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from .models import CommandStatus, DeviceKind, Role, RoomType
+from .models import BedState, CommandStatus, DeviceKind, RecStatus, RequestStatus, Role, RoomType
 
-# Bilinen metrikler (yeni metrik eklemek serbest; bunlar arayüzün tanıdıkları)
+# Bilinen metrikler (yeni metrik eklemek serbest; bunlar arayüzün ve çıkarım motorunun tanıdıkları)
 KNOWN_METRICS = {
-    "co2_ppm": "CO2 (ppm)",
-    "pm25": "PM2.5 (µg/m³)",
-    "occupancy": "Doluluk (kişi)",
+    "bed_load_kg": "Yatak yükü (kg)",       # yük hücresi + HX711
+    "bed_occupied": "Yatakta hasta (0/1)",  # yük hücresi yerine FSR vb. kullanılırsa
+    "motion": "Hareket (PIR tetik sayısı)",
+    "door_open": "Kapı açık (0/1)",
+    "door_events": "Kapı açılma sayısı",
     "temp_c": "Sıcaklık (°C)",
     "humidity": "Nem (%)",
-    "fan_pct": "Taze hava fanı (%)",
-    "purifier_pct": "Hava temizleyici (%)",
-    "light_pct": "Aydınlatma (%)",
-    "power_w": "Oda gücü (W)",
-    # bina kapsamı
-    "pv_kw": "Güneş üretimi (kW)",
-    "load_kw": "Toplam tüketim (kW)",
-    "battery_pct": "Batarya (%)",
-    "grid_kw": "Şebekeden çekilen (kW)",
+    "co2_ppm": "CO2 (ppm, isteğe bağlı)",
+    "rssi": "Wi-Fi sinyali (dBm)",
 }
-ACTUATORS = {"fan": "fan_pct", "purifier": "purifier_pct", "light": "light_pct"}
+# Oda düğümündeki çıkışlar (isteğe bağlı): kapıdaki durum LED'i
+ACTUATORS = {"led": "led_state"}
+
+STATE_TR = {"occupied": "Dolu", "vacated": "Boşaldı – temizlik bekliyor", "cleaning": "Temizleniyor",
+            "ready": "Hazır", "unknown": "Bilinmiyor"}
 
 
 # ---------- Kullanıcılar ----------
@@ -80,10 +79,13 @@ class RoomOut(BaseModel):
     id: str
     code: str
     name: str
+    ward: str
     type: RoomType
     priority: int
     floor: int
-    volume_m3: float
+    beds: int
+    sex: str
+    isolation: bool
     layout: dict
     thresholds: dict
 
@@ -91,10 +93,13 @@ class RoomOut(BaseModel):
 class RoomCreate(BaseModel):
     code: str
     name: str
-    type: RoomType = RoomType.other
+    ward: str = "Genel"
+    type: RoomType = RoomType.patient
     priority: int | None = None
     floor: int = 3
-    volume_m3: float = 45.0
+    beds: int = Field(default=1, ge=1, le=6)
+    sex: str = Field(default="any", pattern="^(any|F|M)$")
+    isolation: bool = False
     layout: dict = {}
     thresholds: dict = {}
 
@@ -102,7 +107,50 @@ class RoomCreate(BaseModel):
 class RoomState(RoomOut):
     metrics: dict[str, float]
     updated_at: datetime | None
-    status: str  # ok | warning | critical | offline
+    state: BedState
+    state_label: str
+    confidence: float
+    state_source: str
+    state_since: datetime | None
+    his_state: BedState
+    his_updated_at: datetime | None
+    hidden_free: bool = Field(description="IoT'ye göre hazır ama HBYS'de hazır görünmüyor")
+    reserved_for: str | None
+    online: bool
+
+
+class StateIn(BaseModel):
+    """Dış sınıflandırıcı (ör. Erva'nın ML modeli) ya da operatör oda durumunu doğrudan bildirir."""
+    state: BedState
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    ts: datetime | None = None
+
+
+class LabelIn(BaseModel):
+    """Laboratuvar kaydı sırasında gerçek durum etiketi."""
+    state: BedState
+    ts: datetime | None = None
+    note: str = ""
+
+
+class LabelOut(BaseModel):
+    id: int
+    room_id: str
+    ts: datetime
+    state: BedState
+    note: str
+    labeled_by: str
+
+
+class TransitionOut(BaseModel):
+    id: int
+    room_id: str
+    ts: datetime
+    from_state: BedState
+    to_state: BedState
+    source: str
+    confidence: float
+    channel: str
 
 
 # ---------- Cihazlar ----------
@@ -128,7 +176,7 @@ class DeviceCreated(DeviceOut):
 
 
 class TelemetryIn(BaseModel):
-    """ESP32 (veya simülatör) ölçüm gönderimi. Örn: {"metrics": {"co2_ppm": 812, "occupancy": 2}}"""
+    """ESP32 (veya simülatör) ölçüm gönderimi. Örn: {"metrics": {"bed_load_kg": 71.5, "motion": 2, "door_open": 0}}"""
     metrics: dict[str, float]
     ts: datetime | None = None
     room_id: str | None = Field(default=None, description="Boşsa cihazın atandığı oda kullanılır")
@@ -175,7 +223,7 @@ class AgentCreated(AgentOut):
 
 class ActionIn(BaseModel):
     room_id: str
-    actuator: str = Field(description="fan | purifier | light")
+    actuator: str = Field(description="led")
     value: float = Field(ge=0, le=100)
 
 
@@ -202,26 +250,112 @@ class DecisionOut(BaseModel):
 
 
 class ManualCommandIn(BaseModel):
-    actuator: str
+    actuator: str = "led"
     value: float = Field(ge=0, le=100)
     reason: str = "Elle müdahale"
 
 
+# ---------- Yatış talepleri ve öneriler ----------
+class BedRequestIn(BaseModel):
+    patient_ref: str = Field(default="", max_length=40, description="Sentetik kod; gerçek kimlik girilmez")
+    ward: str
+    sex: str = Field(default="any", pattern="^(any|F|M)$")
+    isolation: bool = False
+    urgency: int = Field(default=3, ge=1, le=5)
+    origin: str = Field(default="ed", pattern="^(ed|elective|transfer)$")
+    allow_overflow: bool = False
+    note: str = Field(default="", max_length=300)
+
+
+class BedRequestOut(BaseModel):
+    id: str
+    patient_ref: str
+    ward: str
+    sex: str
+    isolation: bool
+    urgency: int
+    origin: str
+    allow_overflow: bool
+    note: str
+    status: RequestStatus
+    assigned_room_id: str | None
+    created_at: datetime
+    assigned_at: datetime | None
+    waiting_min: float | None = None
+
+
+class CandidateIn(BaseModel):
+    room_id: str
+    score: float | None = None
+    reason: str = Field(default="", max_length=500)
+
+
+class RecommendationIn(BaseModel):
+    """Ajan önerisi: bir talep için en fazla 3 aday oda. Sunucu her adayı kısıt katmanından geçirir."""
+    request_id: str
+    candidates: list[CandidateIn] = Field(min_length=1, max_length=3)
+    rationale: str = Field(default="", max_length=2000)
+    data: dict = {}
+
+
+class Candidate(BaseModel):
+    room_id: str
+    room_code: str | None = None
+    rank: int
+    score: float | None = None
+    reason: str = ""
+    violations: list[str] = []
+
+
+class RecommendationOut(BaseModel):
+    id: str
+    request_id: str
+    request: BedRequestOut | None = None
+    agent_id: str
+    agent_name: str | None = None
+    agent_type: str | None = None
+    candidates: list[Candidate]
+    rationale: str
+    data: dict
+    status: RecStatus
+    chosen_room_id: str | None
+    decided_by: str | None
+    decided_at: datetime | None
+    decision_note: str
+    created_at: datetime
+
+
+class ApproveIn(BaseModel):
+    room_id: str | None = Field(default=None, description="Boşsa ilk geçerli aday")
+    note: str = Field(default="", max_length=300)
+
+
+class RejectIn(BaseModel):
+    note: str = Field(default="", max_length=300)
+
+
 # ---------- Genel görünüm ----------
-class SiteEnergy(BaseModel):
-    pv_kw: float | None = None
-    load_kw: float | None = None
-    battery_pct: float | None = None
-    grid_kw: float | None = None
-    sim_hour: float | None = None   # simülasyon saati (simülatör açıksa)
-    updated_at: datetime | None = None
+class Kpis(BaseModel):
+    ed_waiting: int = Field(description="Acil serviste yatak bekleyen hasta")
+    avg_wait_min: float | None = Field(description="Bekleyenlerin ortalama bekleme süresi (dk)")
+    max_wait_min: float | None
+    ready_beds: int
+    hidden_free: int = Field(description="IoT'ye göre hazır, HBYS'de hazır görünmeyen yatak")
+    soon_ready: int = Field(description="Boşaldı ya da temizleniyor")
+    occupied: int
+    unknown: int
+    total_rooms: int
+    pending_recommendations: int
+    sim_clock: str | None = None
+    time_scale: float = Field(default=1.0, description="Simülasyon hızı; süreleri sim dakikasına çevirmek için")
 
 
 class Overview(BaseModel):
     rooms: list[RoomState]
-    energy: SiteEnergy
+    kpis: Kpis
+    requests: list[BedRequestOut]
+    recommendations: list[RecommendationOut]
     decisions: list[DecisionOut]
-    alerts: int
     agents_online: int
     server_time: datetime
 

@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Akıllı Hastane Paneli</title>
+<title>Yatak Yönetimi Paneli</title>
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 <!-- Giriş -->
 <section id="login-view" class="login" hidden>
   <form id="login-form" class="login-card">
-    <div class="brand big"><span class="logo">✚</span> Akıllı Hastane</div>
-    <p class="muted">Agent'larla yönetilen iç hava kalitesi ve enerji paneli</p>
+    <div class="brand big"><span class="logo">✚</span> Yatak Yönetimi</div>
+    <p class="muted">IoT destekli çok ajanlı hastane yatak yönetimi paneli</p>
     <label>Kullanıcı adı<input name="username" autocomplete="username" required></label>
     <label>Parola<input name="password" type="password" autocomplete="current-password" required></label>
     <button class="btn primary" type="submit">Giriş yap</button>
@@ -23,13 +23,13 @@
 <!-- Uygulama -->
 <section id="app-view" hidden>
   <header class="topbar">
-    <div class="brand"><span class="logo">✚</span> Akıllı Hastane <span class="muted">· 3. Kat</span></div>
+    <div class="brand"><span class="logo">✚</span> Yatak Yönetimi</div>
     <nav class="tabs">
       <button data-view="dashboard" class="tab active">Panel</button>
       <button data-view="admin" class="tab admin-only">Yönetim</button>
     </nav>
     <div class="top-right">
-      <span id="sim-clock" class="pill" title="Simülasyon saati"></span>
+      <span id="sim-clock" class="pill" title="Simülasyon saati" hidden></span>
       <span id="conn" class="dot ok" title="Sunucu bağlantısı"></span>
       <span id="who" class="muted"></span>
       <button id="logout" class="btn ghost">Çıkış</button>
@@ -37,34 +37,42 @@
   </header>
 
   <main id="dashboard" class="view">
-    <section class="energy" id="energy"></section>
-    <section class="grid">
-      <div class="card plan-card">
+    <section class="kpis" id="kpis"></section>
+    <section class="layout">
+      <div class="card plan">
         <div class="card-head">
           <h2>Kat planı</h2>
-          <div class="legend">
-            <span><i class="sw ok"></i>Normal</span><span><i class="sw warning"></i>Uyarı</span>
-            <span><i class="sw critical"></i>Kritik</span><span><i class="sw offline"></i>Veri yok</span>
+          <div class="plan-tools">
+            <select id="ward-filter" aria-label="Servis"><option value="">Tüm servisler</option></select>
+            <label class="small muted"><input type="checkbox" id="show-his"> HBYS durumunu göster</label>
           </div>
         </div>
-        <svg id="plan" viewBox="-1 -1 102 58" role="img" aria-label="Kat planı"></svg>
-        <div class="plan-metric">
-          Renk: <select id="plan-metric">
-            <option value="status">Genel durum</option>
-            <option value="co2_ppm">CO2</option>
-            <option value="pm25">PM2.5</option>
-            <option value="occupancy">Doluluk</option>
-          </select>
+        <div class="col-head" aria-hidden="true">
+          <span></span><span class="st-occupied">Dolu</span><span class="st-vacated">Temizlik bekliyor</span>
+          <span class="st-cleaning">Temizleniyor</span><span class="st-ready">Hazır</span>
         </div>
+        <div id="lanes"></div>
+        <p class="small muted legend">
+          <span class="chip hidden-free">Gizli boş</span> IoT'ye göre hazır, HBYS'de hazır görünmüyor ·
+          <span class="chip reserved">Ayrıldı</span> onaylanan hasta bekleniyor ·
+          <span class="chip unknown">?</span> sensör verisi yok
+        </p>
       </div>
-      <div class="card" id="room-detail"></div>
-    </section>
-    <section class="card">
-      <div class="card-head">
-        <h2>Agent karar akışı</h2>
-        <label class="small muted"><input type="checkbox" id="feed-room-only"> Sadece seçili oda</label>
-      </div>
-      <ol id="feed" class="feed"></ol>
+      <aside class="side">
+        <div class="card">
+          <div class="card-head"><h2>Ajan önerileri</h2><span class="small muted" id="rec-count"></span></div>
+          <div id="recs" class="recs"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Acil serviste yatak bekleyenler</h2>
+            <button class="btn small operator-only" id="new-req">+ Talep</button></div>
+          <ol id="queue" class="queue"></ol>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Ajan akışı</h2></div>
+          <ol id="feed" class="feed"></ol>
+        </div>
+      </aside>
     </section>
   </main>
 
@@ -72,11 +80,20 @@
     <nav class="subtabs">
       <button data-sub="users" class="tab active">Kullanıcılar</button>
       <button data-sub="devices" class="tab">Cihazlar</button>
-      <button data-sub="agents" class="tab">Agent'lar</button>
+      <button data-sub="agents" class="tab">Ajanlar</button>
     </nav>
     <div id="admin-body"></div>
   </main>
 </section>
+
+<!-- Oda detayı -->
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-bg" data-close></div>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <button class="btn ghost close" data-close aria-label="Kapat">✕</button>
+    <div id="drawer-body"></div>
+  </div>
+</div>
 
 <div id="toast" class="toast" hidden></div>
 <script type="module" src="/static/app.js"></script>

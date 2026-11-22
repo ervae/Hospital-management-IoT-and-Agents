@@ -1,184 +1,223 @@
-"""Hastane katı simülatörü.
+"""Sanal sensör üreteci ve basit hasta akışı (demo ve test için).
 
-Her oda için sahte bir cihaz gibi davranır: ölçüm üretir (CO2 kütle dengesi, PM2.5, doluluk),
-kendisine gelen komutları (fan/temizleyici/ışık) uygular ve onaylar. Ayrıca güneş paneli + batarya
-simüle eder. Gerçek ESP32 bir odaya bağlanınca simülatör o odayı otomatik bırakır.
+Her oda için gerçek bir oda düğümü gibi davranır: yük hücresi (bed_load_kg), PIR (motion),
+kapı (door_events), sıcaklık ve nem üretir. Odanın gizli "gerçek" durumu şu döngüyü izler:
 
-Simülasyon saati hızlandırılmıştır (varsayılan 20x: bir gün ~72 dakika).
+    dolu ──taburcu──► boşaldı ──temizlikçi gelir──► temizleniyor ──temizlik biter──► hazır
+     ▲                                                                                │
+     └──────────── onaylanan yatış ya da planlı yatış ile hasta gelir ◄──────────────┘
+
+Sunucu bu ölçümlerden durumu kendisi çıkarır (services/room_state.py); simülatör yalnızca
+gerçek durumu etiket olarak (StateLabel) kaydeder, böylece çıkarımın F1'i ölçülebilir.
+HBYS'ye giriş gecikmeli yapılır (HASTANE_HIS_DELAY_MIN), aradaki fark "gizli boş yatak"tır.
+Arızalar: HASTANE_SIM_DROP (veri kaybı) ve HASTANE_SIM_NOISE (hatalı okuma).
+
+Not: Bitirme projesindeki asıl deney simülatörü (SimPy, 4 servis ~120 yatak) ayrı bir modüldür;
+bu adaptör panelin canlı çalışmasını ve uçtan uca entegrasyonu göstermek içindir.
+Gerçek ESP32 bir odaya bağlanınca simülatör o odayı otomatik bırakır.
 """
 from __future__ import annotations
 
 import asyncio
-import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
 from ..config import settings
+from ..models import (BedRequest, BedState, Device, DeviceKind, RequestStatus, Room, RoomStatus,
+                      StateLabel, utcnow)
 from ..db import get_engine
-from ..models import Command, CommandStatus, Device, DeviceKind, Room, RoomType
-from ..services import core
+from ..services import core, flow
 from .base import Adapter
 
-CO2_OUT = 420.0          # dış hava ppm
-CO2_GEN = 0.0052         # kişi başı CO2 üretimi, L/s (oturan/dinlenen yetişkin)
 TZ = timezone(timedelta(hours=3))  # İstanbul
-
-VACANT_ROOMS = {"H304"}  # demo: boş hasta odası (enerji tasarrufu gösterimi)
-MAX_OCC = {RoomType.icu: 3, RoomType.patient: 3, RoomType.waiting: 25, RoomType.corridor: 8,
-           RoomType.other: 4}
+SENSORS = ["bed_load_kg", "motion", "door_events", "temp_c", "humidity"]
 
 
 @dataclass
 class RoomSim:
     room_id: str
-    rtype: RoomType
-    volume: float
-    co2: float = 600.0
-    pm25: float = 10.0
-    occ: int = 0
-    fan: float = 20.0
-    purifier: float = 0.0
-    light: float = 0.0
+    ward: str
+    isolation: bool
+    sex: str
+    truth: BedState = BedState.ready
+    until: float = 0.0          # mevcut aşamanın biteceği sim zamanı (sn)
+    weight: float = 0.0
     temp: float = 22.5
     hum: float = 45.0
-    extra: dict = field(default_factory=dict)
+    incoming_at: float | None = None   # rezerve hastanın geleceği zaman
 
 
 class Simulator(Adapter):
     name = "simulator"
 
-    def __init__(self) -> None:
+    def __init__(self, seed: int | None = None) -> None:
         super().__init__()
+        self.rng = random.Random(seed)
         self.rooms: dict[str, RoomSim] = {}
-        self.devices: dict[str, str] = {}  # room_id -> sim device id
-        self.sim_time = datetime.now(TZ)
-        self.battery_kwh = 6.0
-        self.capacity_kwh = 10.0
-        self.pv_peak_kw = 5.0
-        self.cloud = 1.0
-        self.rng = random.Random()
+        self.devices: dict[str, str] = {}   # room_id -> sim cihaz id
+        self.t = 0.0                        # sim zamanı (sn, başlangıçtan beri)
+        self.t0 = datetime.now(TZ).replace(hour=8, minute=0, second=0, microsecond=0)
+        self.his_queue: list[tuple[float, str, BedState]] = []
+        self.patient_no = 1000
+
+    # ---------- yardımcılar ----------
+    def _h(self, hours: float) -> float:
+        return hours * 3600
+
+    def _los(self) -> float:
+        """Yatış süresi: 1-5 gün arası, ortalama ~3 gün."""
+        return self._h(self.rng.lognormvariate(4.1, 0.45))
+
+    def clock(self) -> str:
+        now = self.t0 + timedelta(seconds=self.t)
+        return f"Gün {int(self.t // 86400) + 1} · {now:%H:%M}"
+
+    def _label(self, s: Session, sim: RoomSim, state: BedState, note: str) -> None:
+        sim.truth = state
+        s.add(StateLabel(room_id=sim.room_id, ts=utcnow(), state=state, note=note, labeled_by="simulator"))
+
+    def _his_later(self, sim: RoomSim, state: BedState, delay_s: float) -> None:
+        self.his_queue.append((self.t + delay_s, sim.room_id, state))
 
     # ---------- kurulum ----------
     def _ensure_devices(self, s: Session) -> None:
         rooms = s.exec(select(Room)).all()
-        physical_rooms = {d.room_id for d in s.exec(select(Device).where(
+        physical = {d.room_id for d in s.exec(select(Device).where(
             Device.kind == DeviceKind.physical, Device.active == True)).all()}  # noqa: E712
         for r in rooms:
             dev = s.exec(select(Device).where(Device.room_id == r.id, Device.kind == DeviceKind.simulated)).first()
             if dev is None:
                 dev = Device(name=f"SIM-{r.code}", room_id=r.id, kind=DeviceKind.simulated,
-                             capabilities={"sensors": ["co2_ppm", "pm25", "occupancy", "temp_c", "humidity"],
-                                           "actuators": ["fan", "purifier", "light"]})
+                             capabilities={"sensors": SENSORS, "actuators": [],
+                                           "time_scale": settings.simulator_speed})
                 s.add(dev)
-            # Gerçek cihaz varsa simülasyon o odada durur
-            dev.active = r.id not in physical_rooms
+            dev.capabilities = {**(dev.capabilities or {}), "time_scale": settings.simulator_speed}
+            dev.active = r.id not in physical
             s.add(dev)
             if dev.active:
                 self.devices[r.id] = dev.id
                 if r.id not in self.rooms:
-                    self.rooms[r.id] = RoomSim(r.id, r.type, r.volume_m3,
-                                               co2=self.rng.uniform(500, 750), pm25=self.rng.uniform(6, 14),
-                                               extra={"vacant": r.code in VACANT_ROOMS})
+                    self.rooms[r.id] = self._initial(s, r)
             else:
                 self.devices.pop(r.id, None)
                 self.rooms.pop(r.id, None)
         s.commit()
 
-    # ---------- fizik ----------
-    def _occupancy(self, sim: RoomSim) -> int:
-        h = self.sim_time.hour + self.sim_time.minute / 60
-        mx = MAX_OCC.get(sim.rtype, 4)
-        if sim.rtype == RoomType.waiting:
-            day = max(0.0, math.sin(math.pi * (h - 7) / 13)) if 7 <= h <= 20 else 0.03
-            target = mx * day
-        elif sim.rtype == RoomType.corridor:
-            target = mx * (0.6 if 8 <= h <= 19 else 0.1)
-        elif sim.rtype == RoomType.icu:
-            target = 1 + (1.5 if 9 <= h <= 18 else 0.3)  # hasta + personel
-        else:  # hasta odası: ziyaret saatleri
-            visit = 1.5 if (13 <= h <= 15 or 18 <= h <= 20) else 0.2
-            target = 0 if sim.extra.get("vacant") else 1 + visit
-        # yumuşak değişim + gürültü
-        if sim.extra.get("vacant"):
-            return 0
-        new = sim.occ + (target - sim.occ) * 0.3 + self.rng.gauss(0, 0.35)
-        return max(0, min(mx, round(new)))
-
-    def _step_room(self, sim: RoomSim, dt: float) -> dict[str, float]:
-        sim.occ = self._occupancy(sim)
-        ach = 0.4 + (sim.fan / 100.0) * 6.0                    # hava değişimi / saat
-        gen_ppm_s = sim.occ * CO2_GEN / 1000.0 / sim.volume * 1e6  # ppm/s
-        # dC/dt = üretim - havalandırma*(C - Cdış); kararlı çözüm adım adım
-        k = ach / 3600.0
-        c_eq = CO2_OUT + gen_ppm_s / k
-        sim.co2 = c_eq + (sim.co2 - c_eq) * math.exp(-k * dt) + self.rng.gauss(0, 4)
-        # PM2.5: dış hava sızması + insan kaynaklı + temizleyici giderimi
-        pm_out = 18 + 8 * math.sin(self.sim_time.hour / 24 * 2 * math.pi)
-        k_pm = (0.3 + ach * 0.3) / 3600 + (sim.purifier / 100.0) * 7.0 / 3600
-        src = sim.occ * 0.004 * (45 / sim.volume)
-        if self.rng.random() < 0.002 * dt / 60:  # ara sıra olay (temizlik, kapı açılması)
-            sim.pm25 += self.rng.uniform(15, 35)
-        p_eq = (0.3 + ach * 0.3) / 3600 * pm_out / k_pm + src / k_pm
-        sim.pm25 = max(1.0, p_eq + (sim.pm25 - p_eq) * math.exp(-k_pm * dt) + self.rng.gauss(0, 0.3))
-        sim.temp += (22.5 + sim.occ * 0.15 - sim.temp) * 0.05 + self.rng.gauss(0, 0.03)
-        sim.hum += (45 + sim.occ * 0.4 - sim.hum) * 0.05 + self.rng.gauss(0, 0.1)
-        power = 15 + sim.fan * 0.6 + sim.purifier * 0.45 + sim.light * 0.35
-        return {"co2_ppm": round(sim.co2, 1), "pm25": round(sim.pm25, 1), "occupancy": sim.occ,
-                "temp_c": round(sim.temp, 2), "humidity": round(sim.hum, 1), "fan_pct": sim.fan,
-                "purifier_pct": sim.purifier, "light_pct": sim.light, "power_w": round(power, 1)}
-
-    def _step_energy(self, dt: float, room_power_w: float) -> dict[str, float]:
-        h = self.sim_time.hour + self.sim_time.minute / 60
-        self.cloud = max(0.25, min(1.0, self.cloud + self.rng.gauss(0, 0.03)))
-        sun = max(0.0, math.sin(math.pi * (h - 7) / 10)) if 7 <= h <= 17 else 0.0
-        pv = self.pv_peak_kw * sun * self.cloud
-        load = 1.5 + room_power_w / 1000.0  # sabit yükler + odalar
-        net = pv - load                       # + fazla, - açık
-        hours = dt / 3600
-        if net >= 0:
-            charge = min(net * hours * 0.95, self.capacity_kwh - self.battery_kwh)
-            self.battery_kwh += charge
-            grid = -(net - charge / hours / 0.95) if hours else 0
+    def _initial(self, s: Session, r: Room) -> RoomSim:
+        sim = RoomSim(r.id, r.ward, r.isolation, r.sex, temp=self.rng.uniform(21.5, 23.5))
+        x = self.rng.random()
+        if x < 0.75:
+            state, sim.until, sim.weight = BedState.occupied, self.rng.uniform(0, 3) * 86400, self.rng.uniform(55, 95)
+        elif x < 0.85:
+            state, sim.until = BedState.vacated, self.rng.uniform(5, 45) * 60
+        elif x < 0.9:
+            state, sim.until = BedState.cleaning, self.rng.uniform(10, 30) * 60
         else:
-            need = -net * hours
-            discharge = min(need, max(0.0, self.battery_kwh - 0.15 * self.capacity_kwh))
-            self.battery_kwh -= discharge
-            grid = (need - discharge) / hours if hours else 0
-        return {"pv_kw": round(pv, 3), "load_kw": round(load, 3),
-                "battery_pct": round(100 * self.battery_kwh / self.capacity_kwh, 1),
-                "grid_kw": round(grid, 3), "sim_hour": round(h, 2)}
+            state = BedState.ready
+        self._label(s, sim, state, "başlangıç")
+        core.set_his_state(s, r.id, state if state != BedState.cleaning else BedState.vacated, source="simulator")
+        return sim
 
-    # ---------- komutlar ----------
-    def _apply_commands(self, s: Session) -> None:
-        dev_to_room = {v: k for k, v in self.devices.items()}
-        if not dev_to_room:
-            return
-        cmds = s.exec(select(Command).where(Command.status == CommandStatus.pending,
-                                            Command.device_id.in_(list(dev_to_room)))).all()
-        for c in sorted(cmds, key=lambda c: c.created_at):
-            sim = self.rooms.get(dev_to_room[c.device_id])
-            if sim is None:
-                continue
-            setattr(sim, c.actuator, float(c.value))
-            core.ack_command(s, c, CommandStatus.done)
+    # ---------- gerçek durum makinesi ----------
+    def _advance(self, s: Session, sim: RoomSim, reserved: str | None) -> int:
+        """Gerçek durumu ilerletir; bu adımdaki kapı olayı sayısını döndürür."""
+        door = 0
+        if sim.truth == BedState.occupied and self.t >= sim.until:
+            self._label(s, sim, BedState.vacated, "taburcu")
+            sim.weight, door = 0.0, 1
+            sim.until = self.t + self.rng.uniform(15, 60) * 60      # temizlikçinin gelmesi
+            self._his_later(sim, BedState.vacated, self.rng.uniform(0, 20) * 60)
+        elif sim.truth == BedState.vacated and self.t >= sim.until:
+            self._label(s, sim, BedState.cleaning, "temizlik başladı")
+            door = 1
+            sim.until = self.t + self.rng.uniform(20, 40) * 60
+        elif sim.truth == BedState.cleaning and self.t >= sim.until:
+            self._label(s, sim, BedState.ready, "temizlik bitti")
+            door = 1
+            # HBYS gecikmesi: ortalama his_delay_min, üstel dağılım
+            self._his_later(sim, BedState.ready, self.rng.expovariate(1 / max(settings.his_delay_min, 1)) * 60)
+        elif sim.truth == BedState.ready and reserved:
+            if sim.incoming_at is None:
+                sim.incoming_at = self.t + self.rng.uniform(5, 20) * 60
+            elif self.t >= sim.incoming_at:
+                self._admit(s, sim, "onaylanan yatış")
+                door = 1
+        return door
+
+    def _admit(self, s: Session, sim: RoomSim, note: str) -> None:
+        self._label(s, sim, BedState.occupied, note)
+        sim.weight, sim.incoming_at = self.rng.uniform(50, 100), None
+        sim.until = self.t + self._los()
+        core.set_his_state(s, sim.room_id, BedState.occupied, source="simulator")
+
+    def _sensors(self, sim: RoomSim, door: int, dt: float) -> dict[str, float]:
+        mins = dt / 60
+        if sim.truth == BedState.occupied:
+            load = sim.weight + self.rng.gauss(0, 1.5)
+            motion = self.rng.random() < 0.15 * mins and 1 or 0     # hasta ara sıra hareket eder
+        elif sim.truth == BedState.cleaning:
+            load = abs(self.rng.gauss(0, 0.8)) + (self.rng.random() < 0.2) * self.rng.uniform(2, 8)  # yatağa dokunma
+            motion = self.rng.randint(3, 6)
+        else:
+            load = abs(self.rng.gauss(0, 0.6))
+            motion = 0
+        sim.temp += (22.5 + (0.4 if sim.truth == BedState.occupied else 0) - sim.temp) * 0.05 + self.rng.gauss(0, 0.03)
+        sim.hum += (45 - sim.hum) * 0.05 + self.rng.gauss(0, 0.2)
+        m = {"bed_load_kg": round(max(0.0, load), 1), "motion": motion, "door_events": door,
+             "temp_c": round(sim.temp, 2), "humidity": round(sim.hum, 1)}
+        if settings.sim_noise and self.rng.random() < settings.sim_noise:  # hatalı okuma
+            if self.rng.random() < 0.5:
+                m["bed_load_kg"] = round(self.rng.choice([0.0, self.rng.uniform(40, 90)]), 1)
+            else:
+                m["motion"] = self.rng.randint(0, 6)
+        return m
+
+    # ---------- hasta gelişi ----------
+    def _arrivals(self, s: Session, dt: float) -> None:
+        n = len(self.rooms) or 1
+        per_s = settings.sim_ed_rate * n / 86400
+        wards = sorted({r.ward for r in self.rooms.values()}) or ["Dahiliye"]
+        # Acil servisten yatış talebi
+        if self.rng.random() < per_s * dt:
+            self.patient_no += 1
+            urg = self.rng.choices([1, 2, 3, 4, 5], [0.05, 0.25, 0.4, 0.2, 0.1])[0]
+            flow.create_request(s, {"patient_ref": f"H-{self.patient_no}", "ward": self.rng.choice(wards),
+                                    "sex": self.rng.choice(["F", "M"]), "isolation": self.rng.random() < 0.08,
+                                    "urgency": urg, "origin": "ed"}, "simulator")
+        # Planlı yatış: doğrudan hazır bir odaya (onay akışına girmez)
+        if self.rng.random() < per_s * dt:
+            ready = [sim for sim in self.rooms.values() if sim.truth == BedState.ready and sim.incoming_at is None
+                     and not (s.get(RoomStatus, sim.room_id) and s.get(RoomStatus, sim.room_id).reserved_for)]
+            if ready:
+                self._admit(s, self.rng.choice(ready), "planlı yatış")
 
     # ---------- döngü ----------
     def tick(self, s: Session) -> None:
         dt = settings.simulator_interval_s * settings.simulator_speed
         self._ensure_devices(s)
-        self._apply_commands(s)
-        self.sim_time += timedelta(seconds=dt)
-        total_power = 0.0
+        self.t += dt
+        core.SIM["clock"] = self.clock()
+        reserved = {st.room_id: st.reserved_for for st in s.exec(select(RoomStatus)).all()}
         for room_id, sim in list(self.rooms.items()):
-            m = self._step_room(sim, dt)
-            total_power += m["power_w"]
+            door = self._advance(s, sim, reserved.get(room_id))
+            m = self._sensors(sim, door, dt)
+            if settings.sim_drop and self.rng.random() < settings.sim_drop:
+                continue  # veri kaybı
             core.ingest(s, m, room_id, device_id=self.devices[room_id])
-        # simüle olmayan (gerçek) odaların gücü de toplam yüke girsin
-        core.ingest(s, self._step_energy(dt, total_power + 120 * (8 - len(self.rooms))), None,
-                    device_id="SIM-SITE")
+        due = [x for x in self.his_queue if x[0] <= self.t]
+        self.his_queue = [x for x in self.his_queue if x[0] > self.t]
+        for _, room_id, state in due:
+            if room_id in self.rooms:
+                core.set_his_state(s, room_id, state, source="simulator")
+        self._arrivals(s, dt)
+        # İptal: çok uzun bekleyen talepler (gerçekte başka hastaneye sevk)
+        for req in s.exec(select(BedRequest).where(BedRequest.status == RequestStatus.waiting)).all():
+            if (flow.wait_min(req) or 0) * settings.simulator_speed > 48 * 60:
+                flow.cancel_request(s, req, "simulator")
+        s.commit()
 
     def _tick_once(self) -> None:
         with Session(get_engine()) as s:

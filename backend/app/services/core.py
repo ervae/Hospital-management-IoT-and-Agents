@@ -7,21 +7,15 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 from sqlmodel import Session, col, select
 
-from ..models import (Agent, AuditLog, Command, CommandStatus, Decision, Device, LatestReading,
-                      Reading, Room, RoomType, utcnow)
-from ..schemas import ACTUATORS, DecisionOut, RoomState, SiteEnergy
-from . import bus
+from ..models import (Agent, AuditLog, BedState, Command, CommandStatus, Decision, Device,
+                      LatestReading, Reading, Room, RoomStatus, StateTransition, utcnow)
+from ..schemas import ACTUATORS, STATE_TR, DecisionOut, RoomState
+from . import bus, room_state
 
 SITE = "site"
 OFFLINE_AFTER = timedelta(minutes=5)
-
-DEFAULT_THRESHOLDS = {
-    RoomType.icu: {"co2_warn": 800, "co2_crit": 1000, "pm25_warn": 12, "pm25_crit": 25},
-    RoomType.patient: {"co2_warn": 1000, "co2_crit": 1400, "pm25_warn": 15, "pm25_crit": 35},
-    RoomType.waiting: {"co2_warn": 1000, "co2_crit": 1500, "pm25_warn": 25, "pm25_crit": 50},
-    RoomType.corridor: {"co2_warn": 1100, "co2_crit": 1600, "pm25_warn": 25, "pm25_crit": 50},
-    RoomType.other: {"co2_warn": 1000, "co2_crit": 1500, "pm25_warn": 25, "pm25_crit": 50},
-}
+SIM = {"clock": None}  # simülatör açıksa simülasyon saati ("Gün 2 · 14:05")
+STATE_METRICS = {"bed_load_kg", "bed_occupied", "motion", "door_open", "door_events"}
 
 
 def _aware(ts: datetime | None) -> datetime | None:
@@ -32,11 +26,6 @@ def _aware(ts: datetime | None) -> datetime | None:
 
 def audit(s: Session, actor: str, action: str, target: str = "", detail: str = "") -> None:
     s.add(AuditLog(actor=actor, action=action, target=target, detail=detail))
-
-
-def thresholds_for(room: Room) -> dict:
-    return {**DEFAULT_THRESHOLDS.get(room.type, DEFAULT_THRESHOLDS[RoomType.other]),
-            **(room.thresholds or {})}
 
 
 # ---------------- Ölçümler ----------------
@@ -63,7 +52,65 @@ def ingest(s: Session, metrics: dict[str, float], room_id: str | None,
         count += 1
     s.commit()
     bus.publish("reading", {"room_id": room_id, "device_id": device_id, "metrics": metrics, "ts": ts})
+    if room_id is not None and STATE_METRICS & set(metrics):
+        infer_state(s, room_id, metrics, ts, device_id)
     return count
+
+
+# ---------------- Oda durumu ----------------
+def get_status(s: Session, room_id: str) -> RoomStatus:
+    st = s.get(RoomStatus, room_id)
+    if st is None:
+        st = RoomStatus(room_id=room_id)
+        s.add(st)
+    return st
+
+
+def infer_state(s: Session, room_id: str, metrics: dict, ts: datetime, device_id: str | None) -> None:
+    """Ölçümden oda durumunu çıkarır (room_state.step). Dış sınıflandırıcı kullanan oda atlanır."""
+    room = s.get(Room, room_id)
+    if room is None or (room.thresholds or {}).get("inference") == "external":
+        return
+    dev = s.get(Device, device_id) if device_id else None
+    p = room_state.params(room.thresholds, dev.capabilities if dev else None)
+    st = get_status(s, room_id)
+    res = room_state.step(st.state, st.ctx or {}, metrics, ts, p)
+    st.ctx = res.ctx
+    set_state(s, room_id, res.state, res.confidence, "inference", ts, status=st)
+
+
+def set_state(s: Session, room_id: str, state: BedState, confidence: float, source: str,
+              ts: datetime | None = None, status: RoomStatus | None = None) -> RoomStatus:
+    ts = _aware(ts) or utcnow()
+    st = status or get_status(s, room_id)
+    old = st.state
+    st.confidence, st.source, st.updated_at = confidence, source, ts
+    if old != state:
+        st.state, st.since = state, ts
+        s.add(StateTransition(room_id=room_id, ts=ts, from_state=old, to_state=state, source=source,
+                              confidence=confidence, channel="iot"))
+        if state == BedState.occupied and st.reserved_for:
+            st.reserved_for = None  # rezerve edilen hasta yatağa geldi
+    s.add(st)
+    s.commit()
+    if old != state:
+        bus.publish("state", {"room_id": room_id, "from": old.value, "to": state.value, "ts": ts})
+    return st
+
+
+def set_his_state(s: Session, room_id: str, state: BedState, ts: datetime | None = None,
+                  source: str = "manual") -> RoomStatus:
+    """HBYS'deki (elle girilen) durumu günceller. IoT durumundan bağımsızdır."""
+    ts = _aware(ts) or utcnow()
+    st = get_status(s, room_id)
+    if st.his_state != state:
+        s.add(StateTransition(room_id=room_id, ts=ts, from_state=st.his_state, to_state=state,
+                              source=source, confidence=1.0, channel="his"))
+        st.his_state = state
+    st.his_updated_at = ts
+    s.add(st)
+    s.commit()
+    return st
 
 
 def latest_by_scope(s: Session) -> dict[str, dict]:
@@ -77,34 +124,31 @@ def latest_by_scope(s: Session) -> dict[str, dict]:
     return out
 
 
-def room_status(room: Room, metrics: dict, updated_at: datetime | None) -> str:
-    if updated_at is None or utcnow() - updated_at > OFFLINE_AFTER:
-        return "offline"
-    t = thresholds_for(room)
-    co2, pm = metrics.get("co2_ppm"), metrics.get("pm25")
-    if (co2 is not None and co2 >= t["co2_crit"]) or (pm is not None and pm >= t["pm25_crit"]):
-        return "critical"
-    if (co2 is not None and co2 >= t["co2_warn"]) or (pm is not None and pm >= t["pm25_warn"]):
-        return "warning"
-    return "ok"
+def is_online(updated_at: datetime | None) -> bool:
+    return updated_at is not None and utcnow() - updated_at <= OFFLINE_AFTER
 
 
 def room_states(s: Session) -> list[RoomState]:
     latest = latest_by_scope(s)
-    rooms = s.exec(select(Room).order_by(Room.priority, Room.code)).all()
+    statuses = {st.room_id: st for st in s.exec(select(RoomStatus)).all()}
+    rooms = s.exec(select(Room).order_by(Room.ward, Room.code)).all()
     out = []
     for r in rooms:
         d = latest.get(r.id, {"metrics": {}, "updated_at": None})
-        out.append(RoomState(**r.model_dump(), metrics=d["metrics"], updated_at=d["updated_at"],
-                             status=room_status(r, d["metrics"], d["updated_at"])))
+        st = statuses.get(r.id) or RoomStatus(room_id=r.id)
+        online = is_online(d["updated_at"])
+        state = st.state
+        # Sensör susarsa çıkarılan durum artık güvenilmez: BİLİNMİYOR
+        if st.source in ("inference", "none") and not online:
+            state = BedState.unknown
+        out.append(RoomState(
+            **r.model_dump(), metrics=d["metrics"], updated_at=d["updated_at"], state=state,
+            state_label=STATE_TR[state.value], confidence=st.confidence if state == st.state else 0.0,
+            state_source=st.source, state_since=_aware(st.since), his_state=st.his_state,
+            his_updated_at=_aware(st.his_updated_at),
+            hidden_free=state == BedState.ready and st.his_state != BedState.ready and not st.reserved_for,
+            reserved_for=st.reserved_for, online=online))
     return out
-
-
-def site_energy(s: Session) -> SiteEnergy:
-    d = latest_by_scope(s).get(SITE, {"metrics": {}, "updated_at": None})
-    m = d["metrics"]
-    return SiteEnergy(pv_kw=m.get("pv_kw"), load_kw=m.get("load_kw"), battery_pct=m.get("battery_pct"),
-                      grid_kw=m.get("grid_kw"), sim_hour=m.get("sim_hour"), updated_at=d["updated_at"])
 
 
 # ---------------- Komutlar ----------------

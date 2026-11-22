@@ -1,4 +1,4 @@
-"""İlk kurulum: yönetici hesabı ve 8 odalı örnek hastane katı."""
+"""İlk kurulum: yönetici hesabı ve 4 servisli örnek hastane (her serviste 6 tek yataklı oda)."""
 from __future__ import annotations
 
 import logging
@@ -12,17 +12,9 @@ from .security import hash_password
 
 log = logging.getLogger("hastane.seed")
 
-# (kod, ad, tip, hacim m3, kat planı konumu x,y,w,h — 100x56'lık plan üzerinde)
-FLOOR = [
-    ("YB1", "Yoğun Bakım 1", RoomType.icu, 40, (0, 0, 24, 22)),
-    ("YB2", "Yoğun Bakım 2", RoomType.icu, 40, (25, 0, 24, 22)),
-    ("H301", "Hasta Odası 301", RoomType.patient, 45, (50, 0, 24, 22)),
-    ("H302", "Hasta Odası 302", RoomType.patient, 45, (75, 0, 25, 22)),
-    ("KOR", "Koridor", RoomType.corridor, 120, (0, 23, 100, 8)),
-    ("H303", "Hasta Odası 303", RoomType.patient, 45, (0, 32, 24, 22)),
-    ("H304", "Hasta Odası 304", RoomType.patient, 45, (25, 32, 24, 22)),
-    ("BEK", "Bekleme Salonu", RoomType.waiting, 110, (50, 32, 50, 22)),
-]
+# (servis, kod öneki, kat)
+WARDS = [("Dahiliye", "DH", 3), ("Genel Cerrahi", "GC", 4), ("Kardiyoloji", "KR", 5), ("Nöroloji", "NR", 6)]
+ROOMS_PER_WARD = 6
 
 
 def seed(s: Session) -> None:
@@ -37,7 +29,13 @@ def seed(s: Session) -> None:
             f.chmod(0o600)
             log.warning("Yönetici hesabı oluşturuldu: %s / %s (ilk girişte değiştirin)", settings.admin_username, pw)
     if not s.exec(select(Room)).first():
-        for code, name, rtype, vol, (x, y, w, h) in FLOOR:
-            s.add(Room(code=code, name=name, type=rtype, priority=DEFAULT_PRIORITY[rtype], floor=3,
-                       volume_m3=vol, layout={"x": x, "y": y, "w": w, "h": h}))
+        for ward, prefix, floor in WARDS:
+            for i in range(1, ROOMS_PER_WARD + 1):
+                iso = i == ROOMS_PER_WARD  # her servisin son odası izolasyon odası
+                rtype = RoomType.isolation if iso else RoomType.patient
+                code = f"{prefix}-{floor}0{i}"
+                s.add(Room(code=code, name=f"{ward} {floor}0{i}", ward=ward, type=rtype,
+                           priority=DEFAULT_PRIORITY[rtype], floor=floor, isolation=iso,
+                           # tek kişilik odalar; 2. ve 3. oda kadın/erkek ayrımlı örnek
+                           sex={2: "F", 3: "M"}.get(i, "any"), layout={"order": i}))
     s.commit()

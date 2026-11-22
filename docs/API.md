@@ -3,7 +3,6 @@
 Tüm uçlar `/api/v1` altındadır. Canlı ve denenebilir belge: sunucu çalışırken `/docs`.
 
 **Kural:** v1 içinde alanlar sadece **eklenir**; var olan alan silinmez ya da yeniden adlandırılmaz. Kırıcı bir değişiklik gerekirse `/api/v2` açılır. Böylece ESP32 yazılımı ve ajanlar sunucu güncellendiğinde bozulmaz.
-(Not: Proje konusu Kasım 2026'da hava kalitesinden yatak yönetimine döndüğü için v1 bir kez sıfırlandı; henüz sahada cihaz yoktu.)
 
 IoT katmanı ile ajan katmanı arasındaki veri biçimi ve oda durumlarının tanımı: [interface.md](interface.md).
 

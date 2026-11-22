@@ -173,7 +173,7 @@ class Device(SQLModel, table=True):
     name: str
     room_id: str | None = Field(default=None, foreign_key="room.id", index=True)
     kind: DeviceKind = DeviceKind.physical
-    # Cihazın neyi ölçtüğü/sürdüğü, örn. {"sensors": ["co2_ppm"], "actuators": ["fan"]}
+    # Cihazın neyi ölçtüğü/sürdüğü, örn. {"sensors": ["bed_load_kg", "motion"], "actuators": ["led"]}
     capabilities: dict = Field(default_factory=dict, sa_column=Column(JSON))
     key_hash: str = ""
     active: bool = True

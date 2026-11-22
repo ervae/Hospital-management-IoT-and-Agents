@@ -45,7 +45,7 @@ Komut eşlemesi: sunucudan gelen `led` komutunun değeri durumu gösterir: 0 kap
 
 - 5V 2A USB adaptör → ESP32'nin USB girişi. PIR, VIN (5V) pininden; HX711, BME280 ve SCD40, ESP32'nin 3V3 pininden beslenir.
 - Yaklaşık tüketim: ESP32 Wi-Fi tepe ~250 mA, PIR ~1 mA, HX711 ~1.5 mA, BME280 < 1 mA, LED ~20 mA. Toplam ~300 mA.
-- Röle, fan, MOSFET ve 12V besleme bu tasarımda yoktur; şebeke gerilimine hiçbir şey bağlanmaz.
+- Şebeke gerilimine hiçbir şey bağlanmaz; düğüm yalnızca 5V USB ile çalışır.
 - Tüm GND'ler ortaktır.
 
 ## Uyarılar
@@ -88,5 +88,3 @@ Komut eşlemesi: sunucudan gelen `led` komutunun değeri durumu gösterir: 0 kap
 | Kalibrasyon için bilinen ağırlık (ör. 5 L su bidonu ×4) | 1 | 20 kg civarı |
 | Çift taraflı bant, kablo bağı, makaron | 1 | |
 | SCD40 CO2 sensörü | 0–1 | İsteğe bağlı; proje için şart değil |
-
-Önceki tasarımdaki (hava kalitesi) SCD40 zorunlu değil, PMS5003, röle modülü, MOSFET, fan, LM2596 ve 12V adaptör artık gerekmiyor.

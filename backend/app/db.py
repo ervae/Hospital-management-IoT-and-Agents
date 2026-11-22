@@ -44,7 +44,7 @@ def reset_engine(url: str | None = None) -> None:
 
 
 def _old_schema(engine) -> bool:
-    """Hava kalitesi sürümünden kalma veritabanı mı? (oda tablosunda 'ward' sütunu yok)"""
+    """Eski şemadan kalma veritabanı mı? (oda tablosunda 'ward' sütunu yok)"""
     from sqlalchemy import inspect
     insp = inspect(engine)
     return insp.has_table("room") and "ward" not in {c["name"] for c in insp.get_columns("room")}
